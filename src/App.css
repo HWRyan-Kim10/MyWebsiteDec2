@@ -182,9 +182,9 @@ h1 {
 
 .lane {
   flex: 1;
-  height: 320px;
+  height: 360px;
   border-radius: 12px;
-  background: linear-gradient(180deg, #ffffff, #e2e8f0);
+  background: linear-gradient(180deg, #ffffff, #f1f5f9);
   display: flex;
   align-items: flex-end;
   justify-content: center;
@@ -197,28 +197,38 @@ h1 {
   font-weight: 700;
 }
 
+.lane.active {
+  transform: translateY(-2px);
+  border-color: rgba(56, 189, 248, 0.8);
+  box-shadow: 0 16px 34px rgba(2, 6, 23, 0.28);
+}
+
 .lane.disabled {
   opacity: 0.4;
 }
 
 .hit-line {
-  position: relative;
-  width: 90%;
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  top: 250px;
   height: 4px;
-  background: #0f172a;
-  opacity: 0.35;
-  margin-bottom: 52px;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.18);
+  pointer-events: none;
 }
 
 .tile {
-  width: 100%;
-  height: 80px;
-  background: linear-gradient(180deg, #0f172a, #0b1220);
+  width: calc(100% - 12px);
+  height: 92px;
+  background: #000;
+  border: 1px solid rgba(148, 163, 184, 0.25);
   border-radius: 10px;
-  box-shadow: 0 14px 30px rgba(0, 0, 0, 0.55);
-  opacity: 0.75;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.7);
+  opacity: 0.9;
   position: absolute;
-  bottom: 0;
+  top: 0;
+  left: 6px;
   transition: opacity 140ms ease, transform 160ms ease;
 }
 
@@ -234,7 +244,7 @@ h1 {
   font-size: 14px;
   color: #0f172a;
   font-weight: 800;
-  text-shadow: 0 1px 4px rgba(255, 255, 255, 0.7);
+  text-shadow: none;
 }
 
 .pill {

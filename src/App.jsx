@@ -1,72 +1,101 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 
-const laneLabelsP1 = ['A', 'W', 'S', 'D']
-const laneLabelsP2 = ['←', '↑', '↓', '→']
+const LANES = 4
+const laneLabelsP1 = ['A', 'S', 'D', 'F']
+const laneLabelsP2 = ['H', 'J', 'K', 'L']
 
-const NOTE_SPEED = 220 // px per second
-const SPAWN_INTERVAL = 520 // ms between notes
-const HIT_LINE_Y = 260 // px from top within lane
-const HIT_WINDOW = 90 // px window to count as a hit
+const NOTE_SPEED = 320 // px / second
+const SPAWN_INTERVAL = 520 // ms
+const HIT_WINDOW = 110 // px (total window size)
+const LANE_HEIGHT = 360 // keep in sync with CSS .lane height
+const TILE_HEIGHT = 92
+const HIT_LINE_Y = LANE_HEIGHT - TILE_HEIGHT - 18
 
 const keyMappings = {
   a: { player: 'p1', lane: 0 },
-  w: { player: 'p1', lane: 1 },
-  s: { player: 'p1', lane: 2 },
-  d: { player: 'p1', lane: 3 },
-  ArrowLeft: { player: 'p2', lane: 0 },
-  ArrowUp: { player: 'p2', lane: 1 },
-  ArrowDown: { player: 'p2', lane: 2 },
-  ArrowRight: { player: 'p2', lane: 3 },
+  s: { player: 'p1', lane: 1 },
+  d: { player: 'p1', lane: 2 },
+  f: { player: 'p1', lane: 3 },
+  h: { player: 'p2', lane: 0 },
+  j: { player: 'p2', lane: 1 },
+  k: { player: 'p2', lane: 2 },
+  l: { player: 'p2', lane: 3 },
 }
 
-const arrowKeys = new Set(['ArrowLeft', 'ArrowUp', 'ArrowDown', 'ArrowRight'])
+const laneFreqP1 = [261.63, 293.66, 329.63, 392.0] // C4 D4 E4 G4
+const laneFreqP2 = [523.25, 587.33, 659.25, 784.0] // C5 D5 E5 G5
+
+function playTone(audioCtx, freq) {
+  const now = audioCtx.currentTime
+  const osc = audioCtx.createOscillator()
+  const gain = audioCtx.createGain()
+  osc.type = 'sine'
+  osc.frequency.setValueAtTime(freq, now)
+  gain.gain.setValueAtTime(0.0001, now)
+  gain.gain.exponentialRampToValueAtTime(0.18, now + 0.01)
+  gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.16)
+  osc.connect(gain)
+  gain.connect(audioCtx.destination)
+  osc.start(now)
+  osc.stop(now + 0.18)
+}
 
 function App() {
   const [gameState, setGameState] = useState('idle') // idle | countdown | playing | finished
   const [countdown, setCountdown] = useState(3)
   const [timer, setTimer] = useState(60)
-  const [notes, setNotes] = useState([]) // {id, lane, y}
-  const [lastSpawn, setLastSpawn] = useState(null)
-  const [scores, setScores] = useState({ p1: 0, p2: 0 })
-  const [status, setStatus] = useState({ p1: 'ready', p2: 'ready' }) // ready | playing | failed | finished
-  const [cleared, setCleared] = useState({ p1: new Set(), p2: new Set() })
-  const [leaderboard, setLeaderboard] = useState([])
-  const [playerName, setPlayerName] = useState('')
-  const [lastWinner, setLastWinner] = useState(null)
 
-  // Load leaderboard from localStorage on first render
+  const [notes, setNotes] = useState([]) // { id, lane, y }
+  const [cleared, setCleared] = useState({ p1: new Set(), p2: new Set() })
+  const [scores, setScores] = useState({ p1: 0, p2: 0 })
+  const [failed, setFailed] = useState({ p1: false, p2: false })
+  const notesRef = useRef(notes)
+  const clearedRef = useRef(cleared)
+  const failedRef = useRef(failed)
+
   useEffect(() => {
+    notesRef.current = notes
+  }, [notes])
+  useEffect(() => {
+    clearedRef.current = cleared
+  }, [cleared])
+  useEffect(() => {
+    failedRef.current = failed
+  }, [failed])
+
+  const status = useMemo(
+    () => ({
+      p1: failed.p1 ? 'failed' : gameState === 'playing' ? 'playing' : gameState === 'finished' ? 'finished' : 'ready',
+      p2: failed.p2 ? 'failed' : gameState === 'playing' ? 'playing' : gameState === 'finished' ? 'finished' : 'ready',
+    }),
+    [failed, gameState]
+  )
+
+  const [leaderboard, setLeaderboard] = useState(() => {
     const saved = localStorage.getItem('piano-tiles-leaderboard')
-    if (saved) {
-      try {
-        setLeaderboard(JSON.parse(saved))
-      } catch {
-        setLeaderboard([])
-      }
+    if (!saved) return []
+    try {
+      return JSON.parse(saved)
+    } catch {
+      return []
     }
-  }, [])
+  })
+  const [playerName, setPlayerName] = useState('')
 
   const bestScore = useMemo(
     () => Math.max(scores.p1 ?? 0, scores.p2 ?? 0),
     [scores]
   )
 
-  const activeNotes = useMemo(
-    () => ({
-      p1: notes.filter((n) => !cleared.p1.has(n.id)),
-      p2: notes.filter((n) => !cleared.p2.has(n.id)),
-    }),
-    [notes, cleared]
-  )
-
   const startGame = () => {
     setNotes([])
-    setLastSpawn(null)
-    setScores({ p1: 0, p2: 0 })
-    setStatus({ p1: 'ready', p2: 'ready' })
+    notesRef.current = []
     setCleared({ p1: new Set(), p2: new Set() })
-    setLastWinner(null)
+    clearedRef.current = { p1: new Set(), p2: new Set() }
+    setScores({ p1: 0, p2: 0 })
+    setFailed({ p1: false, p2: false })
+    failedRef.current = { p1: false, p2: false }
     setTimer(60)
     setCountdown(3)
     setGameState('countdown')
@@ -75,12 +104,10 @@ function App() {
   // Countdown before play begins
   useEffect(() => {
     if (gameState !== 'countdown') return
-    setCountdown(3)
     const id = setInterval(() => {
       setCountdown((prev) => {
         if (prev <= 1) {
           clearInterval(id)
-          setStatus({ p1: 'playing', p2: 'playing' })
           setGameState('playing')
           return 0
         }
@@ -106,98 +133,122 @@ function App() {
     return () => clearInterval(id)
   }, [gameState])
 
-  // Spawn and animate falling notes
+  // WebAudio (created lazily on first user input)
+  const audioRef = useRef(null)
+  const getAudio = () => {
+    if (audioRef.current) return audioRef.current
+    const AudioContextImpl = window.AudioContext || window.webkitAudioContext
+    if (!AudioContextImpl) return null
+    audioRef.current = new AudioContextImpl()
+    return audioRef.current
+  }
+
+  const lastSpawnRef = useRef(null)
   useEffect(() => {
     if (gameState !== 'playing') return
     let rafId
     let lastTs = performance.now()
+    lastSpawnRef.current = null
+
     const tick = (ts) => {
       const dt = ts - lastTs
       lastTs = ts
 
-      setNotes((prev) =>
-        prev
-          .map((n) => ({ ...n, y: n.y + (NOTE_SPEED * dt) / 1000 }))
-          .filter((n) => n.y < HIT_LINE_Y + HIT_WINDOW * 2) // keep until safely past
-      )
+      let nextNotes = notesRef.current
+        .map((n) => ({ ...n, y: n.y + (NOTE_SPEED * dt) / 1000 }))
+        .filter((n) => n.y < LANE_HEIGHT + TILE_HEIGHT + 40)
 
-      setLastSpawn((prev) => {
-        if (prev === null || ts - prev >= SPAWN_INTERVAL) {
-          const lane = Math.floor(Math.random() * 4)
-          const id = crypto.randomUUID ? crypto.randomUUID() : `${ts}-${lane}`
-          setNotes((prevNotes) => [...prevNotes, { id, lane, y: -140 }])
-          return ts
+      if (
+        lastSpawnRef.current === null ||
+        ts - lastSpawnRef.current >= SPAWN_INTERVAL
+      ) {
+        lastSpawnRef.current = ts
+        const lane = Math.floor(Math.random() * LANES)
+        const id = crypto.randomUUID ? crypto.randomUUID() : `${ts}-${lane}`
+        nextNotes = [...nextNotes, { id, lane, y: -TILE_HEIGHT - 10 }]
+      }
+
+      // Commit notes
+      notesRef.current = nextNotes
+      setNotes(nextNotes)
+
+      // Miss detection: if a note passes the hit line and isn’t cleared, fail that player
+      ;(['p1', 'p2']).forEach((player) => {
+        if (failedRef.current[player]) return
+        const missed = nextNotes.some(
+          (n) =>
+            n.y > HIT_LINE_Y + HIT_WINDOW / 2 &&
+            !clearedRef.current[player].has(n.id)
+        )
+        if (missed) {
+          const nextFailed = { ...failedRef.current, [player]: true }
+          failedRef.current = nextFailed
+          setFailed(nextFailed)
         }
-        return prev
       })
+
+      if (failedRef.current.p1 && failedRef.current.p2) {
+        setGameState('finished')
+      }
 
       rafId = requestAnimationFrame(tick)
     }
+
     rafId = requestAnimationFrame(tick)
     return () => cancelAnimationFrame(rafId)
   }, [gameState])
 
-  // End early if both players fail
-  useEffect(() => {
-    if (gameState !== 'playing') return
-    if (status.p1 === 'failed' && status.p2 === 'failed') {
-      setGameState('finished')
-    }
-  }, [gameState, status])
-
-  // Decide winner when finished
-  useEffect(() => {
-    if (gameState !== 'finished') return
-    if (scores.p1 === scores.p2) {
-      setLastWinner('draw')
-    } else {
-      setLastWinner(scores.p1 > scores.p2 ? 'p1' : 'p2')
-    }
-    setStatus((prev) => ({
-      p1: prev.p1 === 'failed' ? 'failed' : 'finished',
-      p2: prev.p2 === 'failed' ? 'failed' : 'finished',
-    }))
-  }, [gameState, scores])
+  const failPlayer = useCallback((player) => {
+    if (failedRef.current[player]) return
+    const nextFailed = { ...failedRef.current, [player]: true }
+    failedRef.current = nextFailed
+    setFailed(nextFailed)
+    if (nextFailed.p1 && nextFailed.p2) setGameState('finished')
+  }, [])
 
   const handleKeyDown = useCallback(
     (event) => {
       if (gameState !== 'playing') return
-      const key =
-        event.key.length === 1 ? event.key.toLowerCase() : event.key
-      if (arrowKeys.has(event.key)) {
-        event.preventDefault() // prevent page scroll when using arrow keys
-      }
+
+      const key = event.key.length === 1 ? event.key.toLowerCase() : event.key
       const mapping = keyMappings[key]
       if (!mapping) return
-      if (status[mapping.player] === 'failed') return
-      setNotes((prev) => {
-        const idx = prev.findIndex(
-          (n) =>
-            n.lane === mapping.lane &&
-            Math.abs(n.y - HIT_LINE_Y) <= HIT_WINDOW / 2 &&
-            !cleared[mapping.player].has(n.id)
-        )
-        if (idx === -1) {
-          setStatus((s) => ({ ...s, [mapping.player]: 'failed' }))
-          return prev
-        }
-        const note = prev[idx]
-        setCleared((c) => {
-          const next = {
-            ...c,
-            [mapping.player]: new Set(c[mapping.player]),
-          }
-          next[mapping.player].add(note.id)
-          return next
-        })
-        setScores((prevScore) => ({
-          ...prevScore,
-          [mapping.player]: prevScore[mapping.player] + 1,
-        }))
-        return prev
-      })
+
+      const { player, lane } = mapping
+      if (failed[player]) return
+
+      // Find a hittable note in that lane within the hit window (and not yet cleared for this player)
+      const hit = notesRef.current.find(
+        (n) =>
+          n.lane === lane &&
+          Math.abs(n.y - HIT_LINE_Y) <= HIT_WINDOW / 2 &&
+          !clearedRef.current[player].has(n.id)
+      )
+
+      if (!hit) {
+        // Tapped white space (or wrong timing) -> fail
+        failPlayer(player)
+        return
+      }
+
+      // Mark cleared for this player + increment score
+      const nextCleared = {
+        ...clearedRef.current,
+        [player]: new Set(clearedRef.current[player]),
+      }
+      nextCleared[player].add(hit.id)
+      clearedRef.current = nextCleared
+      setCleared(nextCleared)
+      setScores((prev) => ({ ...prev, [player]: prev[player] + 1 }))
+
+      const audio = getAudio()
+      if (audio) {
+        // resume if suspended (common on first interaction)
+        if (audio.state === 'suspended') audio.resume().catch(() => {})
+        playTone(audio, player === 'p1' ? laneFreqP1[lane] : laneFreqP2[lane])
+      }
     },
-    [cleared, gameState, status]
+    [failed, failPlayer, gameState]
   )
 
   useEffect(() => {
@@ -205,37 +256,20 @@ function App() {
     return () => window.removeEventListener('keydown', handleKeyDown)
   }, [handleKeyDown])
 
-  // Miss detection: if a note passes the hit window and isn’t cleared, fail that player
-  useEffect(() => {
-    if (gameState !== 'playing') return
-    const checkMiss = (player) =>
-      notes.some(
-        (n) => n.y > HIT_LINE_Y + HIT_WINDOW && !cleared[player].has(n.id)
-      )
-    setStatus((prev) => {
-      const next = { ...prev }
-      if (prev.p1 !== 'failed' && checkMiss('p1')) next.p1 = 'failed'
-      if (prev.p2 !== 'failed' && checkMiss('p2')) next.p2 = 'failed'
-      if (next.p1 !== prev.p1 || next.p2 !== prev.p2) {
-        if (next.p1 === 'failed' && next.p2 === 'failed') setGameState('finished')
-        return next
-      }
-      return prev
-    })
-  }, [gameState, notes, cleared])
-
   const submitScore = () => {
     const trimmed = playerName.trim()
     if (!trimmed) return
+    if (bestScore <= 0) return
+
     const entry = {
       id: crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(),
-      name: trimmed,
+      name: trimmed.slice(0, 20),
       score: bestScore,
       createdAt: new Date().toISOString(),
     }
     const updated = [...leaderboard, entry]
       .sort((a, b) => b.score - a.score)
-      .slice(0, 5)
+      .slice(0, 10)
     setLeaderboard(updated)
     localStorage.setItem('piano-tiles-leaderboard', JSON.stringify(updated))
     setPlayerName('')
@@ -250,18 +284,16 @@ function App() {
     <div className="app-shell">
       <header className="page-header">
         <div>
-          <p className="eyebrow">Same-keyboard duel</p>
-          <h1>Competitive Piano Tiles</h1>
+          <p className="eyebrow">Two-player piano tiles</p>
+          <h1>Piano Tiles Duel</h1>
           <p className="lede">
-            Player 1 uses <strong>WASD only</strong> on the left board. Player 2 uses
-            <strong> Arrow keys only</strong> on the right board. The tile only moves
-            when the correct key is hit; a wrong key ends that player&apos;s run.
-            Rack up hits within 60 seconds.
+            Tiles scroll down. Tap each <strong>black tile exactly once</strong> as it
+            reaches the hit line. Tapping empty space or missing a tile ends your run.
           </p>
         </div>
         <div className="header-actions">
           <button className="primary" onClick={startGame}>
-            {gameState === 'playing' ? 'Restart' : 'Start Round'}
+            {gameState === 'playing' ? 'Restart' : 'Start'}
           </button>
           <div className="timers">
             {gameState === 'countdown' ? (
@@ -276,55 +308,44 @@ function App() {
 
       <section className="status-row">
         <div className="score-card">
-          <p className="label">Player 1 (WASD)</p>
+          <p className="label">Player 1 (ASDF)</p>
           <p className="score">{scores.p1}</p>
           <p className={`pill ${status.p1}`}>{status.p1}</p>
         </div>
         <div className="score-card">
-          <p className="label">Player 2 (Arrows)</p>
+          <p className="label">Player 2 (HJKL)</p>
           <p className="score">{scores.p2}</p>
           <p className={`pill ${status.p2}`}>{status.p2}</p>
         </div>
         <div className="score-card">
-          <p className="label">Winner</p>
-          <p className="score">
-            {lastWinner === 'draw'
-              ? 'Draw'
-              : lastWinner === 'p1'
-                ? 'P1'
-                : lastWinner === 'p2'
-                  ? 'P2'
-                  : '—'}
-          </p>
-          <p className="pill neutral">best: {bestScore}</p>
+          <p className="label">Best</p>
+          <p className="score">{bestScore}</p>
+          <p className="pill neutral">60s</p>
         </div>
       </section>
 
       <section className="play-area">
         <PlayerBoard
-          title="Player 1 — WASD"
+          title="Player 1 — ASDF"
           status={status.p1}
           score={scores.p1}
           laneLabels={laneLabelsP1}
-          notes={activeNotes.p1}
+          notes={notes.filter((n) => !cleared.p1.has(n.id))}
         />
         <PlayerBoard
-          title="Player 2 — Arrow Keys"
+          title="Player 2 — HJKL"
           status={status.p2}
           score={scores.p2}
-          flip
           laneLabels={laneLabelsP2}
-          notes={activeNotes.p2}
+          notes={notes.filter((n) => !cleared.p2.has(n.id))}
         />
       </section>
 
       <section className="leaderboard">
         <div className="leaderboard-header">
-      <div>
-            <p className="label">Leaderboard (Top 5)</p>
-            <p className="lede small">
-              Stored locally. Add a backend later for global scores.
-            </p>
+          <div>
+            <p className="label">Leaderboard (Top 10)</p>
+            <p className="lede small">Stored locally in this browser.</p>
           </div>
           <button className="ghost" onClick={resetLeaderboard}>
             Clear
@@ -332,7 +353,7 @@ function App() {
         </div>
         <div className="leaderboard-table">
           {leaderboard.length === 0 && (
-            <p className="muted">No scores yet. Finish a round and submit.</p>
+            <p className="muted">No scores yet. Finish a run and submit.</p>
           )}
           {leaderboard.map((entry, idx) => (
             <div className="row" key={entry.id}>
@@ -357,54 +378,35 @@ function App() {
             onClick={submitScore}
             disabled={gameState !== 'finished' || bestScore <= 0}
           >
-            Submit best score
+            Submit score
           </button>
         </div>
-      </section>
-
-      <section className="rules">
-        <h2>How it works</h2>
-        <ul>
-          <li>Both players see the same tile order for fairness.</li>
-          <li>Hit the highlighted lane key. One mistake ends that player&apos;s run.</li>
-          <li>Round lasts 60 seconds or until both fail.</li>
-          <li>Most correct hits wins. Submit the best score to the leaderboard.</li>
-          <li>Use the restart button to instantly replay.</li>
-        </ul>
       </section>
     </div>
   )
 }
 
-function PlayerBoard({
-  title,
-  status,
-  score,
-  laneLabels,
-  notes,
-  flip = false,
-}) {
+function PlayerBoard({ title, status, score, laneLabels, notes }) {
   return (
-    <div className={`player-board ${flip ? 'flip' : ''}`}>
+    <div className="player-board">
       <div className="player-header">
         <p className="label">{title}</p>
         <p className={`pill ${status}`}>{status}</p>
         <p className="label small">Score: {score}</p>
       </div>
       <div className="lanes">
-        {(flip ? [...laneLabels].reverse() : laneLabels).map((label, idx) => {
-          const laneIndex = flip ? laneLabels.length - 1 - idx : idx
-          const laneNotes = notes?.filter((n) => n.lane === laneIndex) ?? []
+        {laneLabels.map((label, idx) => {
+          const laneNotes = notes?.filter((n) => n.lane === idx) ?? []
+          const isHot =
+            status === 'playing' &&
+            laneNotes.some((n) => Math.abs(n.y - HIT_LINE_Y) <= HIT_WINDOW / 2)
           return (
-            <div
-              key={label}
-              className={`lane ${status === 'failed' ? 'disabled' : ''}`}
-            >
+            <div key={label} className={`lane ${isHot ? 'active' : ''}`}>
               <div className="hit-line" />
               {laneNotes.map((n) => (
                 <div
                   key={n.id}
-                  className="note"
+                  className="tile show"
                   style={{ transform: `translateY(${n.y}px)` }}
                 />
               ))}
