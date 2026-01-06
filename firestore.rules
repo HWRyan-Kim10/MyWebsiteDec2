@@ -1,18 +1,44 @@
-rules_version='2'
+rules_version = '2';
 
 service cloud.firestore {
   match /databases/{database}/documents {
-    match /{document=**} {
-      // This rule allows anyone with your database reference to view, edit,
-      // and delete all data in your database. It is useful for getting
-      // started, but it is configured to expire after 30 days because it
-      // leaves your app open to attackers. At that time, all client
-      // requests to your database will be denied.
-      //
-      // Make sure to write security rules for your app before that time, or
-      // else all client requests to your database will be denied until you
-      // update your rules.
-      allow read, write: if request.time < timestamp.date(2026, 1, 1);
+    function isValidScore(score) {
+      return score is int && score >= 0 && score <= 1000000;
+    }
+
+    function isValidUsername(name) {
+      return name is string && name.size() >= 1 && name.size() <= 20;
+    }
+
+    function hasOnlyAllowedKeys() {
+      return request.resource.data.keys().hasOnly([
+        'score',
+        'username',
+        'p1Score',
+        'p2Score',
+        'createdAt',
+        'updatedAt',
+        'source'
+      ]);
+    }
+
+    // Public global leaderboard. (No auth in this app yet.)
+    match /scores/{scoreId} {
+      allow read: if true;
+
+      allow create: if hasOnlyAllowedKeys()
+        && isValidScore(request.resource.data.score)
+        && isValidUsername(request.resource.data.username)
+        && isValidScore(request.resource.data.p1Score)
+        && isValidScore(request.resource.data.p2Score)
+        && request.resource.data.source is string
+        && request.resource.data.source.size() <= 40
+        // Enforce server timestamps
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time;
+
+      // No deletes/updates from clients (keeps leaderboard tamper-resistant)
+      allow update, delete: if false;
     }
   }
 }
