@@ -18,11 +18,11 @@ const laneLabelsP2 = ['H', 'J', 'K', 'L']
 
 const ROUND_SECONDS = 60
 const BASE_NOTE_SPEED = 320 // px / second
-const MAX_NOTE_SPEED = 820
+const MAX_NOTE_SPEED = 1450
 const BASE_SPAWN_INTERVAL = 520 // ms
-const MIN_SPAWN_INTERVAL = 200
+const MIN_SPAWN_INTERVAL = 140
 const BASE_HIT_WINDOW = 120 // px (total window size)
-const MIN_HIT_WINDOW = 70
+const MIN_HIT_WINDOW = 52
 const LANE_HEIGHT = 360 // keep in sync with CSS .lane height
 const TILE_HEIGHT = 92
 const HIT_LINE_Y = LANE_HEIGHT - TILE_HEIGHT - 18
@@ -124,18 +124,41 @@ function App() {
   const difficulty = useMemo(() => {
     const elapsed = Math.max(0, Math.min(ROUND_SECONDS, ROUND_SECONDS - timer))
     const progress = elapsed / ROUND_SECONDS // 0..1
-    const curve = Math.pow(progress, 1.85)
+    // Exponential difficulty: starts ramping early and accelerates hard.
+    // speed(t) = BASE * exp(k * progress), capped at MAX
+    const speedK = Math.log(MAX_NOTE_SPEED / BASE_NOTE_SPEED)
+    const spawnK = Math.log(BASE_SPAWN_INTERVAL / MIN_SPAWN_INTERVAL)
+    const windowK = Math.log(BASE_HIT_WINDOW / MIN_HIT_WINDOW)
+
+    const speed = Math.min(
+      MAX_NOTE_SPEED,
+      BASE_NOTE_SPEED * Math.exp(speedK * progress)
+    )
+    const spawnInterval = Math.max(
+      MIN_SPAWN_INTERVAL,
+      BASE_SPAWN_INTERVAL * Math.exp(-spawnK * progress)
+    )
+    const hitWindow = Math.max(
+      MIN_HIT_WINDOW,
+      BASE_HIT_WINDOW * Math.exp(-windowK * progress)
+    )
+
+    // Use a separate curve for probabilities (convex: increases earlier than power curve did)
+    const chanceC = 2.6
+    const curve =
+      (Math.exp(chanceC * progress) - 1) / (Math.exp(chanceC) - 1) // 0..1
     const lerp = (a, b) => a + (b - a) * curve
     return {
       progress,
       curve,
-      speed: lerp(BASE_NOTE_SPEED, MAX_NOTE_SPEED),
-      spawnInterval: lerp(BASE_SPAWN_INTERVAL, MIN_SPAWN_INTERVAL),
-      hitWindow: lerp(BASE_HIT_WINDOW, MIN_HIT_WINDOW),
+      speed,
+      spawnInterval,
+      hitWindow,
       // more stacks/chords near the end
-      stackChance: lerp(0.0, 0.55),
-      chordChance: lerp(0.0, 0.45),
-      tripleChance: curve > 0.85 ? (curve - 0.85) / 0.15 * 0.18 : 0,
+      // these are now used as *targets*; we also enforce chords late-game
+      stackChance: lerp(0.05, 0.70),
+      chordChance: lerp(0.08, 0.62),
+      tripleChance: curve > 0.80 ? (curve - 0.80) / 0.20 * 0.28 : 0,
     }
   }, [timer])
 
@@ -145,6 +168,7 @@ function App() {
   const stackChanceRef = useRef(0)
   const chordChanceRef = useRef(0)
   const tripleChanceRef = useRef(0)
+  const progressRef = useRef(0)
 
   useEffect(() => {
     if (gameState !== 'playing') return
@@ -154,6 +178,7 @@ function App() {
     stackChanceRef.current = difficulty.stackChance
     chordChanceRef.current = difficulty.chordChance
     tripleChanceRef.current = difficulty.tripleChance
+    progressRef.current = difficulty.progress
   }, [difficulty, gameState])
 
   // Global leaderboard (Top 10)
@@ -295,11 +320,15 @@ function App() {
   )
 
   const lastSpawnRef = useRef(null)
+  const lastChordAtRef = useRef(0)
+  const lastTripleAtRef = useRef(0)
   useEffect(() => {
     if (gameState !== 'playing') return
     let rafId
     let lastTs = performance.now()
     lastSpawnRef.current = null
+    lastChordAtRef.current = 0
+    lastTripleAtRef.current = 0
 
     const tick = (ts) => {
       const dt = ts - lastTs
@@ -320,8 +349,18 @@ function App() {
             ? crypto.randomUUID()
             : `${ts}-${lane}${suffix ? `-${suffix}` : ''}`
 
+        const progress = progressRef.current
+        const late = progress >= 0.55
+        const veryLate = progress >= 0.82
+
+        // Force noticeable chords in the second half:
+        // If we haven't spawned a chord for ~1.6s late game, force one now.
+        const chordDue = late && ts - lastChordAtRef.current > 1600
+        // Force a triple chord sometimes near the end so it's obvious.
+        const tripleDue = veryLate && ts - lastTripleAtRef.current > 2600
+
         // Very late game: occasional triple chord
-        if (r < tripleChanceRef.current) {
+        if (tripleDue || r < tripleChanceRef.current) {
           const lanes = new Set()
           while (lanes.size < 3) lanes.add(Math.floor(Math.random() * LANES))
           const y0 = -TILE_HEIGHT - 10
@@ -329,6 +368,8 @@ function App() {
             ...nextNotes,
             ...Array.from(lanes).map((lane) => ({ id: makeId(lane), lane, y: y0 })),
           ]
+          lastTripleAtRef.current = ts
+          lastChordAtRef.current = ts
         } else if (r < chordChanceRef.current) {
           // Chord: two lanes at same time (must hit both as they arrive)
           const laneA = Math.floor(Math.random() * LANES)
@@ -340,6 +381,7 @@ function App() {
             { id: makeId(laneA, 'a'), lane: laneA, y: y0 },
             { id: makeId(laneB, 'b'), lane: laneB, y: y0 },
           ]
+          lastChordAtRef.current = ts
         } else if (r < stackChanceRef.current) {
           // Stack: two (sometimes three) tiles in the same lane (double-tap over time)
           const lane = Math.floor(Math.random() * LANES)
@@ -360,6 +402,23 @@ function App() {
           const lane = Math.floor(Math.random() * LANES)
           const id = makeId(lane)
           nextNotes = [...nextNotes, { id, lane, y: -TILE_HEIGHT - 10 }]
+        }
+
+        // If a chord is due and we didn't spawn one via chance, override with a chord.
+        // (Do this last so it wins over stacks/singles.)
+        if (chordDue && ts - lastChordAtRef.current > 0) {
+          // already spawned a chord/triple above
+        } else if (chordDue) {
+          const laneA = Math.floor(Math.random() * LANES)
+          let laneB = Math.floor(Math.random() * LANES)
+          while (laneB === laneA) laneB = Math.floor(Math.random() * LANES)
+          const y0 = -TILE_HEIGHT - 10
+          nextNotes = [
+            ...nextNotes,
+            { id: makeId(laneA, 'fa'), lane: laneA, y: y0 },
+            { id: makeId(laneB, 'fb'), lane: laneB, y: y0 },
+          ]
+          lastChordAtRef.current = ts
         }
       }
 
