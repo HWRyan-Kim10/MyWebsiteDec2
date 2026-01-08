@@ -18,7 +18,7 @@ const laneLabelsP2 = ['H', 'J', 'K', 'L']
 
 const ROUND_SECONDS = 60
 const BASE_NOTE_SPEED = 320 // px / second
-const MAX_NOTE_SPEED = 1450
+const MAX_NOTE_SPEED = 2200
 const BASE_SPAWN_INTERVAL = 520 // ms
 const MIN_SPAWN_INTERVAL = 140
 const BASE_HIT_WINDOW = 120 // px (total window size)
@@ -41,24 +41,84 @@ const keyMappings = {
 const laneFreqP1 = [261.63, 293.66, 329.63, 392.0] // C4 D4 E4 G4
 const laneFreqP2 = [523.25, 587.33, 659.25, 784.0] // C5 D5 E5 G5
 
-function playTone(audioCtx, freq, activeOscillatorsRef) {
+function playPiano(audioCtx, freq, activeSourcesRef) {
   const now = audioCtx.currentTime
-  const osc = audioCtx.createOscillator()
-  const gain = audioCtx.createGain()
-  osc.type = 'sine'
-  osc.frequency.setValueAtTime(freq, now)
-  gain.gain.setValueAtTime(0.0001, now)
-  gain.gain.exponentialRampToValueAtTime(0.18, now + 0.01)
-  gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.16)
-  osc.connect(gain)
-  gain.connect(audioCtx.destination)
-  osc.start(now)
-  osc.stop(now + 0.18)
-  if (activeOscillatorsRef?.current) {
-    activeOscillatorsRef.current.add(osc)
-    osc.onended = () => {
-      activeOscillatorsRef.current?.delete(osc)
+
+  // Simple piano-ish synth: harmonics + percussive envelope + lowpass filter + tiny hammer noise
+  const output = audioCtx.createGain()
+  const filter = audioCtx.createBiquadFilter()
+  filter.type = 'lowpass'
+  filter.frequency.setValueAtTime(3800, now)
+  filter.Q.setValueAtTime(0.7, now)
+
+  output.gain.setValueAtTime(0.0001, now)
+  output.gain.exponentialRampToValueAtTime(0.22, now + 0.008) // attack
+  output.gain.exponentialRampToValueAtTime(0.06, now + 0.12) // decay
+  output.gain.exponentialRampToValueAtTime(0.0001, now + 0.55) // release
+
+  // Fundamental + harmonics
+  const partials = [
+    { mult: 1, type: 'sine', gain: 0.85 },
+    { mult: 2, type: 'sine', gain: 0.28 },
+    { mult: 3, type: 'triangle', gain: 0.18 },
+    { mult: 4, type: 'sine', gain: 0.12 },
+  ]
+
+  const oscillators = partials.map((p, idx) => {
+    const osc = audioCtx.createOscillator()
+    const g = audioCtx.createGain()
+    osc.type = p.type
+    osc.frequency.setValueAtTime(freq * p.mult, now)
+    // tiny detune for richer tone
+    osc.detune.setValueAtTime((idx - 1.5) * 2.2, now)
+    g.gain.setValueAtTime(p.gain, now)
+    osc.connect(g)
+    g.connect(filter)
+    return osc
+  })
+
+  // Hammer noise (very short)
+  const noiseDur = 0.02
+  const noiseBuf = audioCtx.createBuffer(
+    1,
+    Math.floor(audioCtx.sampleRate * noiseDur),
+    audioCtx.sampleRate
+  )
+  const noiseData = noiseBuf.getChannelData(0)
+  for (let i = 0; i < noiseData.length; i++) {
+    noiseData[i] = (Math.random() * 2 - 1) * 0.6
+  }
+  const noise = audioCtx.createBufferSource()
+  noise.buffer = noiseBuf
+  const noiseHp = audioCtx.createBiquadFilter()
+  noiseHp.type = 'highpass'
+  noiseHp.frequency.setValueAtTime(1200, now)
+  const noiseGain = audioCtx.createGain()
+  noiseGain.gain.setValueAtTime(0.0001, now)
+  noiseGain.gain.exponentialRampToValueAtTime(0.08, now + 0.002)
+  noiseGain.gain.exponentialRampToValueAtTime(0.0001, now + noiseDur)
+  noise.connect(noiseHp)
+  noiseHp.connect(noiseGain)
+  noiseGain.connect(filter)
+
+  filter.connect(output)
+  output.connect(audioCtx.destination)
+
+  const stopAt = now + 0.6
+  oscillators.forEach((osc) => {
+    osc.start(now)
+    osc.stop(stopAt)
+  })
+  noise.start(now)
+  noise.stop(now + noiseDur)
+
+  if (activeSourcesRef?.current) {
+    const register = (node) => {
+      activeSourcesRef.current.add(node)
+      node.onended = () => activeSourcesRef.current?.delete(node)
     }
+    oscillators.forEach(register)
+    register(noise)
   }
 }
 
@@ -115,11 +175,19 @@ function App() {
     message: null,
     error: null,
   })
+  const [showResults, setShowResults] = useState(false)
 
   const bestScore = useMemo(
     () => Math.max(scores.p1 ?? 0, scores.p2 ?? 0),
     [scores]
   )
+
+  const roundResult = useMemo(() => {
+    if (scores.p1 === scores.p2) return { winner: 'draw', loser: 'draw' }
+    return scores.p1 > scores.p2
+      ? { winner: 'p1', loser: 'p2' }
+      : { winner: 'p2', loser: 'p1' }
+  }, [scores])
 
   const difficulty = useMemo(() => {
     const elapsed = Math.max(0, Math.min(ROUND_SECONDS, ROUND_SECONDS - timer))
@@ -224,6 +292,7 @@ function App() {
     setFxPulse(null)
     setTimer(60)
     setCountdown(3)
+    setShowResults(false)
     setGameState('countdown')
   }
 
@@ -250,6 +319,7 @@ function App() {
       setTimer((prev) => {
         if (prev <= 1) {
           clearInterval(id)
+          setShowResults(true)
           setGameState('finished')
           return 0
         }
@@ -261,7 +331,7 @@ function App() {
 
   // WebAudio (created lazily on first user input)
   const audioRef = useRef(null)
-  const activeOscillatorsRef = useRef(new Set())
+  const activeSourcesRef = useRef(new Set())
   const getAudio = () => {
     if (audioRef.current) return audioRef.current
     const AudioContextImpl = window.AudioContext || window.webkitAudioContext
@@ -273,14 +343,14 @@ function App() {
   const stopAllAudioNow = useCallback(() => {
     const audio = audioRef.current
     if (!audio) return
-    activeOscillatorsRef.current.forEach((osc) => {
+    activeSourcesRef.current.forEach((node) => {
       try {
-        osc.stop()
+        node.stop()
       } catch {
         // ignore
       }
     })
-    activeOscillatorsRef.current.clear()
+    activeSourcesRef.current.clear()
   }, [])
 
   const failPlayer = useCallback(
@@ -314,7 +384,10 @@ function App() {
       stopAllAudioNow()
       setFxPulse({ id: Date.now(), kind: 'fail', player })
 
-      if (nextFailed.p1 && nextFailed.p2) setGameState('finished')
+      if (nextFailed.p1 && nextFailed.p2) {
+        setShowResults(true)
+        setGameState('finished')
+      }
     },
     [stopAllAudioNow]
   )
@@ -444,6 +517,7 @@ function App() {
       })
 
       if (failedRef.current.p1 && failedRef.current.p2) {
+        setShowResults(true)
       setGameState('finished')
     }
 
@@ -493,15 +567,24 @@ function App() {
       if (audio) {
         // resume if suspended (common on first interaction)
         if (audio.state === 'suspended') audio.resume().catch(() => {})
-        playTone(
+        playPiano(
           audio,
           player === 'p1' ? laneFreqP1[lane] : laneFreqP2[lane],
-          activeOscillatorsRef
+          activeSourcesRef
         )
       }
     },
     [failed, failPlayer, gameState]
   )
+
+  useEffect(() => {
+    if (!showResults) return
+    const onKey = (e) => {
+      if (e.key === 'Escape') setShowResults(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [showResults])
 
   useEffect(() => {
     window.addEventListener('keydown', handleKeyDown)
@@ -597,6 +680,25 @@ function App() {
           <p className="score">{bestScore}</p>
           <p className="pill neutral">60s</p>
         </div>
+        <div className="score-card">
+          <p className="label">Winner</p>
+          <p className="score">
+            {gameState === 'finished'
+              ? roundResult.winner === 'draw'
+              ? 'Draw'
+                : roundResult.winner === 'p1'
+                  ? 'Player 1'
+                  : 'Player 2'
+                  : '—'}
+          </p>
+          <p className="pill neutral">
+            {gameState === 'finished'
+              ? roundResult.winner === 'draw'
+                ? 'tie score'
+                : `${Math.abs(scores.p1 - scores.p2)} lead`
+              : 'ends at 0s'}
+          </p>
+        </div>
       </section>
 
       <section className="play-area">
@@ -690,6 +792,68 @@ function App() {
           </p>
         )}
       </section>
+
+      {gameState === 'finished' && showResults && (
+        <div
+          className="results-overlay"
+          role="dialog"
+          aria-modal="true"
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) setShowResults(false)
+          }}
+        >
+          <div className="results-card" role="document">
+            <p className="label">Round Complete</p>
+            <button
+              className="results-close"
+              type="button"
+              aria-label="Close results"
+              onClick={() => setShowResults(false)}
+            >
+              ×
+            </button>
+            <h2 className="results-title">
+              {roundResult.winner === 'draw'
+                ? 'It’s a draw'
+                : roundResult.winner === 'p1'
+                  ? 'Player 1 wins'
+                  : 'Player 2 wins'}
+            </h2>
+            <div className="results-grid">
+              <div className={`results-row ${roundResult.winner === 'p1' ? 'winner' : roundResult.loser === 'p1' ? 'loser' : ''}`}>
+                <span className="name">Player 1</span>
+                <span className="value">{scores.p1}</span>
+                <span className="tag">
+                  {roundResult.winner === 'p1'
+                    ? 'Winner'
+                    : roundResult.loser === 'p1'
+                      ? 'Loser'
+                      : 'Draw'}
+                </span>
+              </div>
+              <div className={`results-row ${roundResult.winner === 'p2' ? 'winner' : roundResult.loser === 'p2' ? 'loser' : ''}`}>
+                <span className="name">Player 2</span>
+                <span className="value">{scores.p2}</span>
+                <span className="tag">
+                  {roundResult.winner === 'p2'
+                    ? 'Winner'
+                    : roundResult.loser === 'p2'
+                      ? 'Loser'
+                      : 'Draw'}
+                </span>
+              </div>
+            </div>
+            <div className="results-actions">
+              <button className="primary" onClick={startGame}>
+                Play again
+              </button>
+            </div>
+            <p className="lede small">
+              Tip: difficulty ramps exponentially—endgame is meant to be brutal.
+            </p>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
