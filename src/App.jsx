@@ -392,134 +392,159 @@ function App() {
     [stopAllAudioNow]
   )
 
-  const lastSpawnRef = useRef(null)
+  // Tauri stability: fixed-step simulation + dt clamp + render throttle
+  const simAccRef = useRef(0)
+  const spawnAccRef = useRef(0)
+  const lastRenderRef = useRef(0)
   const lastChordAtRef = useRef(0)
   const lastTripleAtRef = useRef(0)
   useEffect(() => {
     if (gameState !== 'playing') return
     let rafId
     let lastTs = performance.now()
-    lastSpawnRef.current = null
+    simAccRef.current = 0
+    spawnAccRef.current = 0
+    lastRenderRef.current = 0
     lastChordAtRef.current = 0
     lastTripleAtRef.current = 0
 
-    const tick = (ts) => {
-      const dt = ts - lastTs
-      lastTs = ts
+    const STEP_MS = 1000 / 60
+    const MAX_DT_MS = 50
 
-      let nextNotes = notesRef.current
-        .map((n) => ({ ...n, y: n.y + (speedRef.current * dt) / 1000 }))
-        .filter((n) => n.y < LANE_HEIGHT + TILE_HEIGHT + 40)
+    const spawnOne = (ts) => {
+      const makeId = (lane, suffix = '') =>
+        crypto.randomUUID
+          ? crypto.randomUUID()
+          : `${ts}-${lane}${suffix ? `-${suffix}` : ''}`
 
-      if (
-        lastSpawnRef.current === null ||
-        ts - lastSpawnRef.current >= spawnIntervalRef.current
-      ) {
-        lastSpawnRef.current = ts
-        const r = Math.random()
-        const makeId = (lane, suffix = '') =>
-          crypto.randomUUID
-            ? crypto.randomUUID()
-            : `${ts}-${lane}${suffix ? `-${suffix}` : ''}`
+      const r = Math.random()
+      const progress = progressRef.current
+      const late = progress >= 0.55
+      const veryLate = progress >= 0.82
 
-        const progress = progressRef.current
-        const late = progress >= 0.55
-        const veryLate = progress >= 0.82
+      // Force noticeable chords in the second half:
+      // If we haven't spawned a chord for ~1.2s late game, force one now.
+      const chordDue = late && ts - lastChordAtRef.current > 1200
+      // Force a triple chord sometimes near the end so it's obvious.
+      const tripleDue = veryLate && ts - lastTripleAtRef.current > 2200
 
-        // Force noticeable chords in the second half:
-        // If we haven't spawned a chord for ~1.6s late game, force one now.
-        const chordDue = late && ts - lastChordAtRef.current > 1600
-        // Force a triple chord sometimes near the end so it's obvious.
-        const tripleDue = veryLate && ts - lastTripleAtRef.current > 2600
+      const y0 = -TILE_HEIGHT - 10
 
-        // Very late game: occasional triple chord
-        if (tripleDue || r < tripleChanceRef.current) {
-          const lanes = new Set()
-          while (lanes.size < 3) lanes.add(Math.floor(Math.random() * LANES))
-          const y0 = -TILE_HEIGHT - 10
-          nextNotes = [
-            ...nextNotes,
-            ...Array.from(lanes).map((lane) => ({ id: makeId(lane), lane, y: y0 })),
-          ]
-          lastTripleAtRef.current = ts
-          lastChordAtRef.current = ts
-        } else if (r < chordChanceRef.current) {
-          // Chord: two lanes at same time (must hit both as they arrive)
-          const laneA = Math.floor(Math.random() * LANES)
-          let laneB = Math.floor(Math.random() * LANES)
-          while (laneB === laneA) laneB = Math.floor(Math.random() * LANES)
-          const y0 = -TILE_HEIGHT - 10
-          nextNotes = [
-            ...nextNotes,
-            { id: makeId(laneA, 'a'), lane: laneA, y: y0 },
-            { id: makeId(laneB, 'b'), lane: laneB, y: y0 },
-          ]
-          lastChordAtRef.current = ts
-        } else if (r < stackChanceRef.current) {
-          // Stack: two (sometimes three) tiles in the same lane (double-tap over time)
-          const lane = Math.floor(Math.random() * LANES)
-          const y0 = -TILE_HEIGHT - 10
-          const y1 = y0 - (TILE_HEIGHT + 14)
-          nextNotes = [
-            ...nextNotes,
-            { id: makeId(lane, '1'), lane, y: y1 },
-            { id: makeId(lane, '0'), lane, y: y0 },
-          ]
-          // Rare third stacked tile near the end
-          if (Math.random() < tripleChanceRef.current * 0.6) {
-            const y2 = y1 - (TILE_HEIGHT + 14)
-            nextNotes = [...nextNotes, { id: makeId(lane, '2'), lane, y: y2 }]
-          }
-        } else {
-          // Single note
-          const lane = Math.floor(Math.random() * LANES)
-          const id = makeId(lane)
-          nextNotes = [...nextNotes, { id, lane, y: -TILE_HEIGHT - 10 }]
-        }
-
-        // If a chord is due and we didn't spawn one via chance, override with a chord.
-        // (Do this last so it wins over stacks/singles.)
-        if (chordDue && ts - lastChordAtRef.current > 0) {
-          // already spawned a chord/triple above
-        } else if (chordDue) {
-          const laneA = Math.floor(Math.random() * LANES)
-          let laneB = Math.floor(Math.random() * LANES)
-          while (laneB === laneA) laneB = Math.floor(Math.random() * LANES)
-          const y0 = -TILE_HEIGHT - 10
-          nextNotes = [
-            ...nextNotes,
-            { id: makeId(laneA, 'fa'), lane: laneA, y: y0 },
-            { id: makeId(laneB, 'fb'), lane: laneB, y: y0 },
-          ]
-          lastChordAtRef.current = ts
-        }
+      const addChord = (a, b, tagA = 'a', tagB = 'b') => {
+        notesRef.current.push({ id: makeId(a, tagA), lane: a, y: y0 })
+        notesRef.current.push({ id: makeId(b, tagB), lane: b, y: y0 })
+        lastChordAtRef.current = ts
       }
 
-      // Commit notes
-      notesRef.current = nextNotes
-      setNotes(nextNotes)
-
-      // Miss detection: if a note passes the hit line and isn’t cleared, fail that player
-      ;(['p1', 'p2']).forEach((player) => {
-        if (failedRef.current[player]) return
-        const missedNote = nextNotes.find(
-          (n) =>
-            n.y > HIT_LINE_Y + hitWindowRef.current / 2 &&
-            !clearedRef.current[player].has(n.id)
-        )
-        if (missedNote) {
-          failPlayer(player, {
-            reason: 'miss',
-            lane: missedNote.lane,
-            noteId: missedNote.id,
-          })
+      const addTriple = () => {
+        const lanes = new Set()
+        while (lanes.size < 3) lanes.add(Math.floor(Math.random() * LANES))
+        for (const lane of lanes) {
+          notesRef.current.push({ id: makeId(lane), lane, y: y0 })
         }
-      })
+        lastTripleAtRef.current = ts
+        lastChordAtRef.current = ts
+      }
+
+      // Very late game: occasional triple chord
+      if (tripleDue || r < tripleChanceRef.current) {
+        addTriple()
+        return
+      }
+
+      // Guarantee chords show up reliably late-game
+      if (chordDue) {
+        const laneA = Math.floor(Math.random() * LANES)
+        let laneB = Math.floor(Math.random() * LANES)
+        while (laneB === laneA) laneB = Math.floor(Math.random() * LANES)
+        addChord(laneA, laneB, 'fa', 'fb')
+        return
+      }
+
+      if (r < chordChanceRef.current) {
+        const laneA = Math.floor(Math.random() * LANES)
+        let laneB = Math.floor(Math.random() * LANES)
+        while (laneB === laneA) laneB = Math.floor(Math.random() * LANES)
+        addChord(laneA, laneB)
+        return
+      }
+
+      if (r < stackChanceRef.current) {
+        // Stack: two (sometimes three) tiles in the same lane (double-tap over time)
+        const lane = Math.floor(Math.random() * LANES)
+        const y1 = y0 - (TILE_HEIGHT + 14)
+        notesRef.current.push({ id: makeId(lane, '1'), lane, y: y1 })
+        notesRef.current.push({ id: makeId(lane, '0'), lane, y: y0 })
+        // Rare third stacked tile near the end
+        if (Math.random() < tripleChanceRef.current * 0.6) {
+          const y2 = y1 - (TILE_HEIGHT + 14)
+          notesRef.current.push({ id: makeId(lane, '2'), lane, y: y2 })
+        }
+        return
+      }
+
+      // Single note
+      const lane = Math.floor(Math.random() * LANES)
+      notesRef.current.push({ id: makeId(lane), lane, y: y0 })
+    }
+
+    const tick = (ts) => {
+      const rawDt = ts - lastTs
+      lastTs = ts
+      const dt = Math.min(MAX_DT_MS, Math.max(0, rawDt))
+
+      simAccRef.current += dt
+      spawnAccRef.current += dt
+
+      // Spawn catch-up: keeps rhythm stable through frame drops (common in Tauri)
+      while (spawnAccRef.current >= spawnIntervalRef.current) {
+        spawnAccRef.current -= spawnIntervalRef.current
+        spawnOne(ts)
+      }
+
+      // Fixed-step simulation: prevents huge jumps when a frame stalls.
+      while (simAccRef.current >= STEP_MS) {
+        const dy = (speedRef.current * STEP_MS) / 1000
+        const prev = notesRef.current
+        const next = []
+        for (let i = 0; i < prev.length; i++) {
+          const n = prev[i]
+          const y = n.y + dy
+          if (y < LANE_HEIGHT + TILE_HEIGHT + 40) next.push({ ...n, y })
+        }
+        notesRef.current = next
+
+        // Miss detection (runs at fixed step so it's consistent)
+        ;(['p1', 'p2']).forEach((player) => {
+          if (failedRef.current[player]) return
+          const missedNote = notesRef.current.find(
+            (n) =>
+              n.y > HIT_LINE_Y + hitWindowRef.current / 2 &&
+              !clearedRef.current[player].has(n.id)
+          )
+          if (missedNote) {
+            failPlayer(player, {
+              reason: 'miss',
+              lane: missedNote.lane,
+              noteId: missedNote.id,
+            })
+          }
+        })
+
+        simAccRef.current -= STEP_MS
+      }
+
+      // Throttle renders (helps Tauri WebView a lot)
+      if (ts - lastRenderRef.current > 33) {
+        lastRenderRef.current = ts
+        setNotes(notesRef.current)
+      }
 
       if (failedRef.current.p1 && failedRef.current.p2) {
         setShowResults(true)
-      setGameState('finished')
-    }
+        setGameState('finished')
+        return
+      }
 
       rafId = requestAnimationFrame(tick)
     }
