@@ -1,34 +1,956 @@
-import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from '/vite.svg'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  addDoc,
+  collection,
+  getDocs,
+  limit,
+  onSnapshot,
+  orderBy,
+  query,
+  serverTimestamp,
+} from 'firebase/firestore'
+import { db } from './firebase'
 import './App.css'
 
+const LANES = 4
+const laneLabelsP1 = ['A', 'S', 'D', 'F']
+const laneLabelsP2 = ['H', 'J', 'K', 'L']
+
+const ROUND_SECONDS = 60
+const BASE_NOTE_SPEED = 320 // px / second
+const MAX_NOTE_SPEED = 2200
+const BASE_SPAWN_INTERVAL = 520 // ms
+const MIN_SPAWN_INTERVAL = 140
+const BASE_HIT_WINDOW = 120 // px (total window size)
+const MIN_HIT_WINDOW = 52
+const LANE_HEIGHT = 360 // keep in sync with CSS .lane height
+const TILE_HEIGHT = 92
+const HIT_LINE_Y = LANE_HEIGHT - TILE_HEIGHT - 18
+
+const keyMappings = {
+  a: { player: 'p1', lane: 0 },
+  s: { player: 'p1', lane: 1 },
+  d: { player: 'p1', lane: 2 },
+  f: { player: 'p1', lane: 3 },
+  h: { player: 'p2', lane: 0 },
+  j: { player: 'p2', lane: 1 },
+  k: { player: 'p2', lane: 2 },
+  l: { player: 'p2', lane: 3 },
+}
+
+const laneFreqP1 = [261.63, 293.66, 329.63, 392.0] // C4 D4 E4 G4
+const laneFreqP2 = [523.25, 587.33, 659.25, 784.0] // C5 D5 E5 G5
+
+function playPiano(audioCtx, freq, activeSourcesRef) {
+  const now = audioCtx.currentTime
+
+  // Simple piano-ish synth: harmonics + percussive envelope + lowpass filter + tiny hammer noise
+  const output = audioCtx.createGain()
+  const filter = audioCtx.createBiquadFilter()
+  filter.type = 'lowpass'
+  filter.frequency.setValueAtTime(3800, now)
+  filter.Q.setValueAtTime(0.7, now)
+
+  output.gain.setValueAtTime(0.0001, now)
+  output.gain.exponentialRampToValueAtTime(0.22, now + 0.008) // attack
+  output.gain.exponentialRampToValueAtTime(0.06, now + 0.12) // decay
+  output.gain.exponentialRampToValueAtTime(0.0001, now + 0.55) // release
+
+  // Fundamental + harmonics
+  const partials = [
+    { mult: 1, type: 'sine', gain: 0.85 },
+    { mult: 2, type: 'sine', gain: 0.28 },
+    { mult: 3, type: 'triangle', gain: 0.18 },
+    { mult: 4, type: 'sine', gain: 0.12 },
+  ]
+
+  const oscillators = partials.map((p, idx) => {
+    const osc = audioCtx.createOscillator()
+    const g = audioCtx.createGain()
+    osc.type = p.type
+    osc.frequency.setValueAtTime(freq * p.mult, now)
+    // tiny detune for richer tone
+    osc.detune.setValueAtTime((idx - 1.5) * 2.2, now)
+    g.gain.setValueAtTime(p.gain, now)
+    osc.connect(g)
+    g.connect(filter)
+    return osc
+  })
+
+  // Hammer noise (very short)
+  const noiseDur = 0.02
+  const noiseBuf = audioCtx.createBuffer(
+    1,
+    Math.floor(audioCtx.sampleRate * noiseDur),
+    audioCtx.sampleRate
+  )
+  const noiseData = noiseBuf.getChannelData(0)
+  for (let i = 0; i < noiseData.length; i++) {
+    noiseData[i] = (Math.random() * 2 - 1) * 0.6
+  }
+  const noise = audioCtx.createBufferSource()
+  noise.buffer = noiseBuf
+  const noiseHp = audioCtx.createBiquadFilter()
+  noiseHp.type = 'highpass'
+  noiseHp.frequency.setValueAtTime(1200, now)
+  const noiseGain = audioCtx.createGain()
+  noiseGain.gain.setValueAtTime(0.0001, now)
+  noiseGain.gain.exponentialRampToValueAtTime(0.08, now + 0.002)
+  noiseGain.gain.exponentialRampToValueAtTime(0.0001, now + noiseDur)
+  noise.connect(noiseHp)
+  noiseHp.connect(noiseGain)
+  noiseGain.connect(filter)
+
+  filter.connect(output)
+  output.connect(audioCtx.destination)
+
+  const stopAt = now + 0.6
+  oscillators.forEach((osc) => {
+    osc.start(now)
+    osc.stop(stopAt)
+  })
+  noise.start(now)
+  noise.stop(now + noiseDur)
+
+  if (activeSourcesRef?.current) {
+    const register = (node) => {
+      activeSourcesRef.current.add(node)
+      node.onended = () => activeSourcesRef.current?.delete(node)
+    }
+    oscillators.forEach(register)
+    register(noise)
+  }
+}
+
 function App() {
-  const [count, setCount] = useState(0)
+  const [gameState, setGameState] = useState('idle') // idle | countdown | playing | finished
+  const [countdown, setCountdown] = useState(3)
+  const [timer, setTimer] = useState(60)
+
+  const [notes, setNotes] = useState([]) // { id, lane, y }
+  const [cleared, setCleared] = useState({ p1: new Set(), p2: new Set() })
+  const [scores, setScores] = useState({ p1: 0, p2: 0 })
+  const [failed, setFailed] = useState({ p1: false, p2: false })
+  const [failMeta, setFailMeta] = useState({ p1: null, p2: null })
+  const [frozenNotes, setFrozenNotes] = useState({ p1: null, p2: null })
+  const [fxPulse, setFxPulse] = useState(null) // { id, kind: 'fail', player: 'p1'|'p2' }
+  const notesRef = useRef(notes)
+  const clearedRef = useRef(cleared)
+  const failedRef = useRef(failed)
+  const frozenNotesRef = useRef(frozenNotes)
+  const failMetaRef = useRef(failMeta)
+
+  useEffect(() => {
+    notesRef.current = notes
+  }, [notes])
+  useEffect(() => {
+    clearedRef.current = cleared
+  }, [cleared])
+  useEffect(() => {
+    failedRef.current = failed
+  }, [failed])
+  useEffect(() => {
+    frozenNotesRef.current = frozenNotes
+  }, [frozenNotes])
+  useEffect(() => {
+    failMetaRef.current = failMeta
+  }, [failMeta])
+
+  const status = useMemo(
+    () => ({
+      p1: failed.p1 ? 'failed' : gameState === 'playing' ? 'playing' : gameState === 'finished' ? 'finished' : 'ready',
+      p2: failed.p2 ? 'failed' : gameState === 'playing' ? 'playing' : gameState === 'finished' ? 'finished' : 'ready',
+    }),
+    [failed, gameState]
+  )
+
+  const [leaderboard, setLeaderboard] = useState([])
+  const [leaderboardState, setLeaderboardState] = useState({
+    loading: true,
+    error: null,
+  })
+  const [playerName, setPlayerName] = useState('')
+  const [submitState, setSubmitState] = useState({
+    loading: false,
+    message: null,
+    error: null,
+  })
+  const [showResults, setShowResults] = useState(false)
+
+  const bestScore = useMemo(
+    () => Math.max(scores.p1 ?? 0, scores.p2 ?? 0),
+    [scores]
+  )
+
+  const roundResult = useMemo(() => {
+    if (scores.p1 === scores.p2) return { winner: 'draw', loser: 'draw' }
+    return scores.p1 > scores.p2
+      ? { winner: 'p1', loser: 'p2' }
+      : { winner: 'p2', loser: 'p1' }
+  }, [scores])
+
+  const difficulty = useMemo(() => {
+    const elapsed = Math.max(0, Math.min(ROUND_SECONDS, ROUND_SECONDS - timer))
+    const progress = elapsed / ROUND_SECONDS // 0..1
+    // Exponential difficulty: starts ramping early and accelerates hard.
+    // speed(t) = BASE * exp(k * progress), capped at MAX
+    const speedK = Math.log(MAX_NOTE_SPEED / BASE_NOTE_SPEED)
+    const spawnK = Math.log(BASE_SPAWN_INTERVAL / MIN_SPAWN_INTERVAL)
+    const windowK = Math.log(BASE_HIT_WINDOW / MIN_HIT_WINDOW)
+
+    const speed = Math.min(
+      MAX_NOTE_SPEED,
+      BASE_NOTE_SPEED * Math.exp(speedK * progress)
+    )
+    const spawnInterval = Math.max(
+      MIN_SPAWN_INTERVAL,
+      BASE_SPAWN_INTERVAL * Math.exp(-spawnK * progress)
+    )
+    const hitWindow = Math.max(
+      MIN_HIT_WINDOW,
+      BASE_HIT_WINDOW * Math.exp(-windowK * progress)
+    )
+
+    // Use a separate curve for probabilities (convex: increases earlier than power curve did)
+    const chanceC = 2.6
+    const curve =
+      (Math.exp(chanceC * progress) - 1) / (Math.exp(chanceC) - 1) // 0..1
+    const lerp = (a, b) => a + (b - a) * curve
+    return {
+      progress,
+      curve,
+      speed,
+      spawnInterval,
+      hitWindow,
+      // more stacks/chords near the end
+      // these are now used as *targets*; we also enforce chords late-game
+      stackChance: lerp(0.05, 0.70),
+      chordChance: lerp(0.08, 0.62),
+      tripleChance: curve > 0.80 ? (curve - 0.80) / 0.20 * 0.28 : 0,
+    }
+  }, [timer])
+
+  const speedRef = useRef(BASE_NOTE_SPEED)
+  const spawnIntervalRef = useRef(BASE_SPAWN_INTERVAL)
+  const hitWindowRef = useRef(BASE_HIT_WINDOW)
+  const stackChanceRef = useRef(0)
+  const chordChanceRef = useRef(0)
+  const tripleChanceRef = useRef(0)
+  const progressRef = useRef(0)
+
+  useEffect(() => {
+    if (gameState !== 'playing') return
+    speedRef.current = difficulty.speed
+    spawnIntervalRef.current = difficulty.spawnInterval
+    hitWindowRef.current = difficulty.hitWindow
+    stackChanceRef.current = difficulty.stackChance
+    chordChanceRef.current = difficulty.chordChance
+    tripleChanceRef.current = difficulty.tripleChance
+    progressRef.current = difficulty.progress
+  }, [difficulty, gameState])
+
+  // Global leaderboard (Top 10)
+  useEffect(() => {
+    const q = query(
+      collection(db, 'scores'),
+      orderBy('score', 'desc'),
+      limit(10)
+    )
+    const unsubscribe = onSnapshot(
+      q,
+      (snap) => {
+        setLeaderboard(
+          snap.docs.map((d) => ({
+            id: d.id,
+            ...d.data(),
+          }))
+        )
+        setLeaderboardState({ loading: false, error: null })
+      },
+      (err) => {
+        setLeaderboardState({
+          loading: false,
+          error: err?.message || 'Failed to load leaderboard.',
+        })
+      }
+    )
+    return () => unsubscribe()
+  }, [])
+
+  const startGame = () => {
+    setNotes([])
+    notesRef.current = []
+    setCleared({ p1: new Set(), p2: new Set() })
+    clearedRef.current = { p1: new Set(), p2: new Set() }
+    setScores({ p1: 0, p2: 0 })
+    setFailed({ p1: false, p2: false })
+    failedRef.current = { p1: false, p2: false }
+    setFailMeta({ p1: null, p2: null })
+    failMetaRef.current = { p1: null, p2: null }
+    setFrozenNotes({ p1: null, p2: null })
+    frozenNotesRef.current = { p1: null, p2: null }
+    setFxPulse(null)
+    setTimer(60)
+    setCountdown(3)
+    setShowResults(false)
+    setGameState('countdown')
+  }
+
+  // Countdown before play begins
+  useEffect(() => {
+    if (gameState !== 'countdown') return
+    const id = setInterval(() => {
+      setCountdown((prev) => {
+        if (prev <= 1) {
+          clearInterval(id)
+          setGameState('playing')
+          return 0
+        }
+        return prev - 1
+      })
+    }, 1000)
+    return () => clearInterval(id)
+  }, [gameState])
+
+  // Main 60s timer
+  useEffect(() => {
+    if (gameState !== 'playing') return
+    const id = setInterval(() => {
+      setTimer((prev) => {
+        if (prev <= 1) {
+          clearInterval(id)
+          setShowResults(true)
+          setGameState('finished')
+          return 0
+        }
+        return prev - 1
+      })
+    }, 1000)
+    return () => clearInterval(id)
+  }, [gameState])
+
+  // WebAudio (created lazily on first user input)
+  const audioRef = useRef(null)
+  const activeSourcesRef = useRef(new Set())
+  const getAudio = () => {
+    if (audioRef.current) return audioRef.current
+    const AudioContextImpl = window.AudioContext || window.webkitAudioContext
+    if (!AudioContextImpl) return null
+    audioRef.current = new AudioContextImpl()
+    return audioRef.current
+  }
+
+  const stopAllAudioNow = useCallback(() => {
+    const audio = audioRef.current
+    if (!audio) return
+    activeSourcesRef.current.forEach((node) => {
+      try {
+        node.stop()
+      } catch {
+        // ignore
+      }
+    })
+    activeSourcesRef.current.clear()
+  }, [])
+
+  const failPlayer = useCallback(
+    (player, meta) => {
+      if (failedRef.current[player]) return
+
+      // Freeze tiles for this player (visual feedback)
+      const snapshot = notesRef.current.map((n) => ({ ...n }))
+      const nextFrozen = { ...frozenNotesRef.current, [player]: snapshot }
+      frozenNotesRef.current = nextFrozen
+      setFrozenNotes(nextFrozen)
+
+      // Record what caused the loss (for highlighting / messaging)
+      const nextMeta = {
+        ...failMetaRef.current,
+        [player]: {
+          reason: meta?.reason ?? 'wrong',
+          lane: meta?.lane ?? null,
+          noteId: meta?.noteId ?? null,
+          at: Date.now(),
+        },
+      }
+      failMetaRef.current = nextMeta
+      setFailMeta(nextMeta)
+
+      // Mark failed + stop audio immediately (instant interruption)
+      const nextFailed = { ...failedRef.current, [player]: true }
+      failedRef.current = nextFailed
+      setFailed(nextFailed)
+
+      stopAllAudioNow()
+      setFxPulse({ id: Date.now(), kind: 'fail', player })
+
+      if (nextFailed.p1 && nextFailed.p2) {
+        setShowResults(true)
+        setGameState('finished')
+      }
+    },
+    [stopAllAudioNow]
+  )
+
+  // Tauri stability: fixed-step simulation + dt clamp + render throttle
+  const simAccRef = useRef(0)
+  const spawnAccRef = useRef(0)
+  const lastRenderRef = useRef(0)
+  const lastChordAtRef = useRef(0)
+  const lastTripleAtRef = useRef(0)
+  useEffect(() => {
+    if (gameState !== 'playing') return
+    let rafId
+    let lastTs = performance.now()
+    simAccRef.current = 0
+    spawnAccRef.current = 0
+    lastRenderRef.current = 0
+    lastChordAtRef.current = 0
+    lastTripleAtRef.current = 0
+
+    const STEP_MS = 1000 / 60
+    const MAX_DT_MS = 50
+
+    const spawnOne = (ts) => {
+      const makeId = (lane, suffix = '') =>
+        crypto.randomUUID
+          ? crypto.randomUUID()
+          : `${ts}-${lane}${suffix ? `-${suffix}` : ''}`
+
+      const r = Math.random()
+      const progress = progressRef.current
+      const late = progress >= 0.55
+      const veryLate = progress >= 0.82
+
+      // Force noticeable chords in the second half:
+      // If we haven't spawned a chord for ~1.2s late game, force one now.
+      const chordDue = late && ts - lastChordAtRef.current > 1200
+      // Force a triple chord sometimes near the end so it's obvious.
+      const tripleDue = veryLate && ts - lastTripleAtRef.current > 2200
+
+      const y0 = -TILE_HEIGHT - 10
+
+      const addChord = (a, b, tagA = 'a', tagB = 'b') => {
+        notesRef.current.push({ id: makeId(a, tagA), lane: a, y: y0 })
+        notesRef.current.push({ id: makeId(b, tagB), lane: b, y: y0 })
+        lastChordAtRef.current = ts
+      }
+
+      const addTriple = () => {
+        const lanes = new Set()
+        while (lanes.size < 3) lanes.add(Math.floor(Math.random() * LANES))
+        for (const lane of lanes) {
+          notesRef.current.push({ id: makeId(lane), lane, y: y0 })
+        }
+        lastTripleAtRef.current = ts
+        lastChordAtRef.current = ts
+      }
+
+      // Very late game: occasional triple chord
+      if (tripleDue || r < tripleChanceRef.current) {
+        addTriple()
+        return
+      }
+
+      // Guarantee chords show up reliably late-game
+      if (chordDue) {
+        const laneA = Math.floor(Math.random() * LANES)
+        let laneB = Math.floor(Math.random() * LANES)
+        while (laneB === laneA) laneB = Math.floor(Math.random() * LANES)
+        addChord(laneA, laneB, 'fa', 'fb')
+        return
+      }
+
+      if (r < chordChanceRef.current) {
+        const laneA = Math.floor(Math.random() * LANES)
+        let laneB = Math.floor(Math.random() * LANES)
+        while (laneB === laneA) laneB = Math.floor(Math.random() * LANES)
+        addChord(laneA, laneB)
+        return
+      }
+
+      if (r < stackChanceRef.current) {
+        // Stack: two (sometimes three) tiles in the same lane (double-tap over time)
+        const lane = Math.floor(Math.random() * LANES)
+        const y1 = y0 - (TILE_HEIGHT + 14)
+        notesRef.current.push({ id: makeId(lane, '1'), lane, y: y1 })
+        notesRef.current.push({ id: makeId(lane, '0'), lane, y: y0 })
+        // Rare third stacked tile near the end
+        if (Math.random() < tripleChanceRef.current * 0.6) {
+          const y2 = y1 - (TILE_HEIGHT + 14)
+          notesRef.current.push({ id: makeId(lane, '2'), lane, y: y2 })
+        }
+        return
+      }
+
+      // Single note
+      const lane = Math.floor(Math.random() * LANES)
+      notesRef.current.push({ id: makeId(lane), lane, y: y0 })
+    }
+
+    const tick = (ts) => {
+      const rawDt = ts - lastTs
+      lastTs = ts
+      const dt = Math.min(MAX_DT_MS, Math.max(0, rawDt))
+
+      simAccRef.current += dt
+      spawnAccRef.current += dt
+
+      // Spawn catch-up: keeps rhythm stable through frame drops (common in Tauri)
+      while (spawnAccRef.current >= spawnIntervalRef.current) {
+        spawnAccRef.current -= spawnIntervalRef.current
+        spawnOne(ts)
+      }
+
+      // Fixed-step simulation: prevents huge jumps when a frame stalls.
+      while (simAccRef.current >= STEP_MS) {
+        const dy = (speedRef.current * STEP_MS) / 1000
+        const prev = notesRef.current
+        const next = []
+        for (let i = 0; i < prev.length; i++) {
+          const n = prev[i]
+          const y = n.y + dy
+          if (y < LANE_HEIGHT + TILE_HEIGHT + 40) next.push({ ...n, y })
+        }
+        notesRef.current = next
+
+        // Miss detection (runs at fixed step so it's consistent)
+        ;(['p1', 'p2']).forEach((player) => {
+          if (failedRef.current[player]) return
+          const missedNote = notesRef.current.find(
+            (n) =>
+              n.y > HIT_LINE_Y + hitWindowRef.current / 2 &&
+              !clearedRef.current[player].has(n.id)
+          )
+          if (missedNote) {
+            failPlayer(player, {
+              reason: 'miss',
+              lane: missedNote.lane,
+              noteId: missedNote.id,
+            })
+          }
+        })
+
+        simAccRef.current -= STEP_MS
+      }
+
+      // Throttle renders (helps Tauri WebView a lot)
+      if (ts - lastRenderRef.current > 33) {
+        lastRenderRef.current = ts
+        setNotes(notesRef.current)
+      }
+
+      if (failedRef.current.p1 && failedRef.current.p2) {
+        setShowResults(true)
+        setGameState('finished')
+        return
+      }
+
+      rafId = requestAnimationFrame(tick)
+    }
+
+    rafId = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(rafId)
+  }, [gameState, failPlayer])
+
+  const handleKeyDown = useCallback(
+    (event) => {
+      if (gameState !== 'playing') return
+
+      const key = event.key.length === 1 ? event.key.toLowerCase() : event.key
+      const mapping = keyMappings[key]
+      if (!mapping) return
+
+      const { player, lane } = mapping
+      if (failed[player]) return
+
+      // Find a hittable note in that lane within the hit window (and not yet cleared for this player)
+      const hit = notesRef.current.find(
+        (n) =>
+          n.lane === lane &&
+          Math.abs(n.y - HIT_LINE_Y) <= hitWindowRef.current / 2 &&
+          !clearedRef.current[player].has(n.id)
+      )
+
+      if (!hit) {
+        // Tapped white space (or wrong timing) -> fail
+        failPlayer(player, { reason: 'wrong', lane, noteId: null })
+        return
+      }
+
+      // Mark cleared for this player + increment score
+      const nextCleared = {
+        ...clearedRef.current,
+        [player]: new Set(clearedRef.current[player]),
+      }
+      nextCleared[player].add(hit.id)
+      clearedRef.current = nextCleared
+      setCleared(nextCleared)
+      setScores((prev) => ({ ...prev, [player]: prev[player] + 1 }))
+
+      const audio = getAudio()
+      if (audio) {
+        // resume if suspended (common on first interaction)
+        if (audio.state === 'suspended') audio.resume().catch(() => {})
+        playPiano(
+          audio,
+          player === 'p1' ? laneFreqP1[lane] : laneFreqP2[lane],
+          activeSourcesRef
+        )
+      }
+    },
+    [failed, failPlayer, gameState]
+  )
+
+  useEffect(() => {
+    if (!showResults) return
+    const onKey = (e) => {
+      if (e.key === 'Escape') setShowResults(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [showResults])
+
+  useEffect(() => {
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [handleKeyDown])
+
+  const submitScore = async () => {
+    const trimmed = playerName.trim().slice(0, 20)
+    if (!trimmed) return
+    if (bestScore <= 0) return
+
+    if (submitState.loading) return
+    setSubmitState({ loading: true, message: null, error: null })
+
+    try {
+      const docRef = await addDoc(collection(db, 'scores'), {
+        username: trimmed,
+        score: Math.floor(bestScore),
+        p1Score: Math.floor(scores.p1 ?? 0),
+        p2Score: Math.floor(scores.p2 ?? 0),
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        source: 'piano-tiles-duel',
+      })
+
+      // Tell the player whether it made Top 10 (otherwise it won't appear).
+      const topQ = query(
+        collection(db, 'scores'),
+        orderBy('score', 'desc'),
+        limit(10)
+      )
+      const topSnap = await getDocs(topQ)
+      const madeTop10 = topSnap.docs.some((d) => d.id === docRef.id)
+
+      setSubmitState({
+        loading: false,
+        message: madeTop10
+          ? 'Submitted! You made the Top 10.'
+          : 'Submitted! (Not in the Top 10 all-time yet.)',
+        error: null,
+      })
+      setPlayerName('')
+    } catch (e) {
+      setSubmitState({
+        loading: false,
+        message: null,
+        error:
+          e?.message ||
+          'Failed to submit score. (Most common: Firestore rules not deployed yet.)',
+      })
+    }
+  }
 
   return (
-    <>
+    <div className="app-shell">
+      <header className="page-header">
+        <div>
+          <p className="eyebrow">Two-player piano tiles</p>
+          <h1>Piano Tiles Duel</h1>
+          <p className="lede">
+            Tiles scroll down. Tap each <strong>black tile exactly once</strong> as it
+            reaches the hit line. Tapping empty space or missing a tile ends your run.
+          </p>
+        </div>
+        <div className="header-actions">
+          <button className="primary" onClick={startGame}>
+            {gameState === 'playing' ? 'Restart' : 'Start'}
+          </button>
+          <div className="timers">
+            {gameState === 'countdown' ? (
+              <span className="countdown">Starts in {countdown}</span>
+            ) : (
+              <span className="timer">Time left: {timer}s</span>
+            )}
+            <span className="state-pill">{gameState}</span>
+          </div>
+        </div>
+      </header>
+
+      <section className="status-row">
+        <div className="score-card">
+          <p className="label">Player 1 (ASDF)</p>
+          <p className="score">{scores.p1}</p>
+          <p className={`pill ${status.p1}`}>{status.p1}</p>
+        </div>
+        <div className="score-card">
+          <p className="label">Player 2 (HJKL)</p>
+          <p className="score">{scores.p2}</p>
+          <p className={`pill ${status.p2}`}>{status.p2}</p>
+        </div>
+        <div className="score-card">
+          <p className="label">Best</p>
+          <p className="score">{bestScore}</p>
+          <p className="pill neutral">60s</p>
+        </div>
+        <div className="score-card">
+          <p className="label">Winner</p>
+          <p className="score">
+            {gameState === 'finished'
+              ? roundResult.winner === 'draw'
+              ? 'Draw'
+                : roundResult.winner === 'p1'
+                  ? 'Player 1'
+                  : 'Player 2'
+                  : '—'}
+          </p>
+          <p className="pill neutral">
+            {gameState === 'finished'
+              ? roundResult.winner === 'draw'
+                ? 'tie score'
+                : `${Math.abs(scores.p1 - scores.p2)} lead`
+              : 'ends at 0s'}
+          </p>
+        </div>
+      </section>
+
+      <section className="play-area">
+        <PlayerBoard
+          player="p1"
+          title="Player 1 — ASDF"
+          status={status.p1}
+          score={scores.p1}
+          laneLabels={laneLabelsP1}
+          failMeta={failMeta.p1}
+          fxPulse={fxPulse}
+          hitWindow={difficulty.hitWindow}
+          notes={
+            failed.p1
+              ? frozenNotes.p1 ?? []
+              : notes.filter((n) => !cleared.p1.has(n.id))
+          }
+        />
+        <PlayerBoard
+          player="p2"
+          title="Player 2 — HJKL"
+          status={status.p2}
+          score={scores.p2}
+          laneLabels={laneLabelsP2}
+          failMeta={failMeta.p2}
+          fxPulse={fxPulse}
+          hitWindow={difficulty.hitWindow}
+          notes={
+            failed.p2
+              ? frozenNotes.p2 ?? []
+              : notes.filter((n) => !cleared.p2.has(n.id))
+          }
+        />
+      </section>
+
+      <section className="leaderboard">
+        <div className="leaderboard-header">
       <div>
-        <a href="https://vite.dev" target="_blank">
-          <img src={viteLogo} className="logo" alt="Vite logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
+            <p className="label">Leaderboard (Top 10 — Global)</p>
+            <p className="lede small">
+              Stored in Firestore (shared across devices). Only Top 10 scores are shown.
+            </p>
+          </div>
+        </div>
+        <div className="leaderboard-table">
+          {leaderboardState.loading && <p className="muted">Loading…</p>}
+          {!leaderboardState.loading && leaderboardState.error && (
+            <p className="muted error">{leaderboardState.error}</p>
+          )}
+          {!leaderboardState.loading &&
+            !leaderboardState.error &&
+            leaderboard.length === 0 && (
+              <p className="muted">No scores yet. Finish a run and submit.</p>
+            )}
+          {!leaderboardState.loading &&
+            !leaderboardState.error &&
+            leaderboard.map((entry, idx) => {
+              const createdAtDate = entry.createdAt?.toDate
+                ? entry.createdAt.toDate()
+                : null
+              return (
+            <div className="row" key={entry.id}>
+              <span className="rank">#{idx + 1}</span>
+                  <span className="name">{entry.username}</span>
+              <span className="score-value">{entry.score} hits</span>
+              <span className="date">
+                    {createdAtDate ? createdAtDate.toLocaleDateString() : '—'}
+              </span>
+            </div>
+              )
+            })}
+        </div>
+        <div className="submit-row">
+          <input
+            type="text"
+            placeholder="Name / initials"
+            value={playerName}
+            onChange={(e) => setPlayerName(e.target.value)}
+          />
+          <button
+            className="primary"
+            onClick={submitScore}
+            disabled={gameState !== 'finished' || bestScore <= 0 || submitState.loading}
+          >
+            {submitState.loading ? 'Submitting…' : 'Submit score'}
+          </button>
+        </div>
+        {(submitState.error || submitState.message) && (
+          <p className={`muted ${submitState.error ? 'error' : ''}`}>
+            {submitState.error || submitState.message}
+          </p>
+        )}
+      </section>
+
+      {gameState === 'finished' && showResults && (
+        <div
+          className="results-overlay"
+          role="dialog"
+          aria-modal="true"
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) setShowResults(false)
+          }}
+        >
+          <div className="results-card" role="document">
+            <p className="label">Round Complete</p>
+            <button
+              className="results-close"
+              type="button"
+              aria-label="Close results"
+              onClick={() => setShowResults(false)}
+            >
+              ×
+            </button>
+            <h2 className="results-title">
+              {roundResult.winner === 'draw'
+                ? 'It’s a draw'
+                : roundResult.winner === 'p1'
+                  ? 'Player 1 wins'
+                  : 'Player 2 wins'}
+            </h2>
+            <div className="results-grid">
+              <div className={`results-row ${roundResult.winner === 'p1' ? 'winner' : roundResult.loser === 'p1' ? 'loser' : ''}`}>
+                <span className="name">Player 1</span>
+                <span className="value">{scores.p1}</span>
+                <span className="tag">
+                  {roundResult.winner === 'p1'
+                    ? 'Winner'
+                    : roundResult.loser === 'p1'
+                      ? 'Loser'
+                      : 'Draw'}
+                </span>
+              </div>
+              <div className={`results-row ${roundResult.winner === 'p2' ? 'winner' : roundResult.loser === 'p2' ? 'loser' : ''}`}>
+                <span className="name">Player 2</span>
+                <span className="value">{scores.p2}</span>
+                <span className="tag">
+                  {roundResult.winner === 'p2'
+                    ? 'Winner'
+                    : roundResult.loser === 'p2'
+                      ? 'Loser'
+                      : 'Draw'}
+                </span>
+              </div>
+            </div>
+            <div className="results-actions">
+              <button className="primary" onClick={startGame}>
+                Play again
+              </button>
+            </div>
+            <p className="lede small">
+              Tip: difficulty ramps exponentially—endgame is meant to be brutal.
+            </p>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function PlayerBoard({ player, title, status, score, laneLabels, notes, failMeta, fxPulse, hitWindow }) {
+  const bestKey = player === 'p1' ? 'piano-tiles-best-p1' : 'piano-tiles-best-p2'
+  const bestEver = useMemo(() => {
+    const raw = localStorage.getItem(bestKey)
+    const n = Number(raw)
+    return Number.isFinite(n) ? n : 0
+  }, [bestKey])
+
+  const isGameOver = status === 'failed' || status === 'finished'
+  const isNewRecord = isGameOver && score > bestEver
+
+  useEffect(() => {
+    if (!isGameOver) return
+    if (score > bestEver) localStorage.setItem(bestKey, String(score))
+  }, [bestEver, bestKey, isGameOver, score])
+
+  return (
+    <div className={`player-board ${fxPulse?.kind === 'fail' && fxPulse?.player === player ? 'shake' : ''}`}>
+      <div className="player-header">
+        <p className="label">{title}</p>
+        <p className={`pill ${status}`}>{status}</p>
+        <p className="label small">Score: {score}</p>
       </div>
-      <h1>Vite + React</h1>
-      <div className="card">
-        <button onClick={() => setCount((count) => count + 1)}>
-          count is {count}
-        </button>
-        <p>
-          Edit <code>src/App.jsx</code> and save to test HMR
-        </p>
+      <div className="lanes">
+        {laneLabels.map((label, idx) => {
+          const laneNotes = notes?.filter((n) => n.lane === idx) ?? []
+          const isHot =
+            status === 'playing' &&
+            laneNotes.some((n) => Math.abs(n.y - HIT_LINE_Y) <= hitWindow / 2)
+          const isFailLane = isGameOver && failMeta?.lane === idx
+          return (
+            <div key={label} className={`lane ${isHot ? 'active' : ''} ${isFailLane ? 'fail' : ''}`}>
+              <div className="hit-line" />
+              {laneNotes.map((n) => (
+                <div
+                  key={n.id}
+                  className={`tile show ${isGameOver && failMeta?.noteId === n.id ? 'fail' : ''}`}
+                  style={{ transform: `translateY(${n.y}px)` }}
+                  />
+                ))}
+              <span className="lane-label">{label}</span>
+            </div>
+          )
+        })}
       </div>
-      <p className="read-the-docs">
-        Click on the Vite and React logos to learn more
-      </p>
-    </>
+
+      {status === 'failed' && (
+        <div className="gameover-overlay" role="status" aria-live="polite">
+          <div className="gameover-card">
+            <p className="label">Game Over</p>
+            <p className="lede small">
+              {failMeta?.reason === 'miss' ? 'Missed a tile.' : 'Tapped empty space.'}
+            </p>
+            <div className="gameover-stats">
+              <div>
+                <p className="label small">Score</p>
+                <p className="score big">{score}</p>
+              </div>
+              <div>
+                <p className="label small">Best</p>
+                <p className="score big">{Math.max(bestEver, score)}</p>
+              </div>
+            </div>
+            {isNewRecord && <p className="new-record">New record!</p>}
+          </div>
+        </div>
+      )}
+    </div>
   )
 }
 
